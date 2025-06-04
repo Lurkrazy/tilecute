@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.runtime import from_dlpack
+from utils.mbar import mbarrier_expect_tx
 
 stages = 3
 cta_tile_shape_mnk = (128, 128, 64)
@@ -181,17 +182,13 @@ def matmul_fp8_nt_kernel(
                 b_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sB, (None, None, 0)))
                 total_transfer_size = a_transfer_size + b_transfer_size
                 
-                if tidx == 128: # [TODO] need to add mbarrier.expect_tx function
-                    cute.arch.mbarrier_init_tx_bytes(mbars + stage, total_transfer_size)
-                else:
-                    cute.arch.mbarrier_arrive(mbars + stage)
+                with cute.arch.elect_one():
+                    mbarrier_expect_tx(mbars + stage, total_transfer_size)
                 
                 cute.copy(tma_atom_a, tAgA, tAsA, tma_bar_ptr=mbars + stage)
                 cute.copy(tma_atom_b, tBgB, tBsB, tma_bar_ptr=mbars + stage)
-                # cute.arch.mbarrier_arrive(mbars + stage)
-                # copy will do mbarrier arrive 
-            else:
-                cute.arch.mbarrier_arrive(mbars + stage)
+            # all threads will arrive
+            cute.arch.mbarrier_arrive(mbars + stage)
         # tile process
         # cute.arch.mbarrier_wait(mbars + ((k_tile_count-1) % stages) + stages, phase^1)
     elif warp_group_idx == 0: # gemm warp group
