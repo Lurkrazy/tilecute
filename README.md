@@ -10,8 +10,8 @@ Tilecute is an experimental backend implementation for Tilelang using cuteDSL. T
 
 ## Current Status
 
-- [OK] elementwise: vectorized LDG & STG, elementwise opertation, custom layout.
-- [x] gemm on Ampere: LDGSTS, Tensor core, pipeline.
+- [x] elementwise: vectorized LDG & STG, elementwise opertation, custom layout.
+- [ ] gemm on Ampere: LDGSTS, Tensor core, pipeline.
 - [x] gemm on Hopper: TMA, warp specialization, mbarrier operation, WGMMA.
 
 ## Getting Started
