@@ -8,7 +8,6 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.runtime import from_dlpack
 from utils.mbar import mbarrier_expect_tx
-from utils.cpsync import tma_load
 
 stages = 3
 cta_tile_shape_mnk = (128, 128, 64)
@@ -53,7 +52,6 @@ def matmul_fp8_nt_kernel(
     tiled_mma: cute.TiledMma,
     a_smem_layout_staged: cute.ComposedLayout,
     b_smem_layout_staged: cute.ComposedLayout,
-    tensormaps: cute.Tensor,
 ):
     tidx, tidy, tidz = cute.arch.thread_idx()
     bidx, bidy, bidz = cute.arch.block_idx()
@@ -66,39 +64,80 @@ def matmul_fp8_nt_kernel(
     if warp_idx == 0:
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+    
+    # Define tile sizes - 128x128x64 CTA tile
+    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
+    
+    thr_mma = tiled_mma.get_slice(0) # warpgroup id
+    # print(tiled_mma)
+    # print(thr_mma)
 
     # Create shared memory allocator
     smem_alloc = cutlass.utils.SmemAllocator()
     storage = smem_alloc.allocate(SharedStorage)
 
     sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-    sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)    
-    # Define tile sizes - 128x128x64 CTA tile
-    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
+    sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
 
-    gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))    
-    # print("gC_local", gC_local.layout)
+    # print("sA", sA.layout)
+    # print("sB", sB.layout)
 
-    thr_mma = tiled_mma.get_slice(0) # warpgroup id
+    # Local tile the global tensors
+    gA_local = cute.local_tile(gA, (cta_tile_m, cta_tile_k), (bidy, None))
+    gB_local = cute.local_tile(gB, (cta_tile_n, cta_tile_k), (bidx, None))
+    gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))
+
 
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
+
+    # print("tCsA", tCsA.layout)
+    # print("tCsB", tCsB.layout)
+    # tC = cute.make_layout((8,16))
+    # tCgC = cute.local_partition(gC_local, (cta_tile_m, cta_tile_n), (bidy, bidx))
     tCgC = thr_mma.partition_C(gC_local)
+    # print("tCgC", tCgC.layout)
+    # C_layout = cute.make_layout(((2,2,16),2,1),stride=((1,2,4),64,0))
+    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
+    # tCrC = thr_mma.make_fragment_C(tCgC)
+
 
     tCrA = thr_mma.make_fragment_A(tCsA)
-    tCrB = thr_mma.make_fragment_B(tCsB)    
-    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
+    tCrB = thr_mma.make_fragment_B(tCsB)
+    # print("tCrA", tCrA.layout)
+    # print("tCrB", tCrB.layout)
+    # Calculate proper accumulator size based on tiled MMA
+  
+    # acc_shape = tCgC.shape
+    # print(acc_shape)
+    # C_local = cute.make_fragment(acc_shape, cutlass.Float32)
 
+    # Compute global tensor coordinates for this CTA
+    # tile_coord_mn = (bidy, bidx)  # Fixed: was (bidx, bidy)
     
+    # Create shared memory tensors
+    tAsA_preslice, tAgA_preslice = cute.nvgpu.cpasync.tma_partition(
+        tma_atom_a,
+        0,  # cta_coord
+        cute.make_layout(1),
+        cute.group_modes(sA, 0, 2), # (tile_m, tile_k, stages) -> ((shape), stages)
+        cute.group_modes(gA_local, 0, 2),
+    )
+
+    tBsB_preslice, tBgB_preslice = cute.nvgpu.cpasync.tma_partition(
+        tma_atom_b,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sB, 0, 2),  
+        cute.group_modes(gB_local, 0, 2),
+    )
+    # print(tAsA_preslice.layout)
+    # print(tAgA_preslice.layout)
+    # print(tBsB_preslice.layout)
+    # print(tBgB_preslice.layout)
 
     mbars = storage.bar.data_ptr()
-    sA_ptr = storage.sA.data_ptr()
-    sB_ptr = storage.sB.data_ptr()
 
-    tensormap_mgr = cutlass.utils.TensorMapManager(cutlass.utils.TensorMapUpdateMode.GMEM, 128)
-
-    tensormap_a_ptr = tensormap_mgr.get_tensormap_ptr(tensormaps[(0, None)].iterator)
-    tensormap_b_ptr = tensormap_mgr.get_tensormap_ptr(tensormaps[(1, None)].iterator)
 
     # Initialize barriers only once per warp group
     if warp_idx == 0:
@@ -110,6 +149,7 @@ def matmul_fp8_nt_kernel(
     cute.arch.barrier() # equivalent to __syncthreads()
 
 
+
     # Calculate number of K tiles
     k_tile_count = 16  # K dimension tiles
     # print("k_tile_count", k_tile_count)
@@ -117,37 +157,39 @@ def matmul_fp8_nt_kernel(
     # TMA warpgroup
     if warp_group_idx == 1: 
         cute.arch.warpgroup_reg_dealloc(24)
-        tensormap_mgr.init_tensormap_from_atom(
-            tma_atom_a,
-            tensormap_a_ptr,
-            warp_group_idx * 4+1, # warp_id
-        )
-        tensormap_mgr.init_tensormap_from_atom(
-            tma_atom_b,
-            tensormap_b_ptr,
-            warp_group_idx * 4+2, # warp_id
-        )
-        # warp_group_sync
-        cute.arch.barrier(barrier_id=1, number_of_threads=128) 
-        tensormap_mgr.fence_tensormap_initialization()
-        # Calculate proper TMA transfer size
-        a_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sA, (None, None, 0)))
-        b_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sB, (None, None, 0)))
-        total_transfer_size = a_transfer_size + b_transfer_size
-        
         # phase = 0
         for k in cutlass.range_dynamic(k_tile_count):
             stage = k % stages
             phase = ((k % 6) // 3) ^ 1
+            # if bidx == 0 and bidy == 0 and warp_idx % 4 == 0:
+            #     with cute.arch.elect_one():
+            #         cute.printf("TMA waiting for Empty mbar with stage %d, phase %d", stage, phase)
             cute.arch.mbarrier_wait(mbars + stage + stages, phase)
+            # Fixed mbarrier phase calculation
+            # if bidx == 0 and bidy == 0 and warp_idx % 4 == 0:
+            #     with cute.arch.elect_one():
+            #         cute.printf("TMA acquired Empty mbar with stage %d, phase %d", stage, phase)
 
             if warp_idx % 4 == 0: 
+                tAsA = tAsA_preslice[(None, stage)]
+                tAgA = tAgA_preslice[(None, k)]
+                if tidx%128==0:
+                    cute.printf("stage: %d, K: %d, tAsA_preslice: %d, tAsA: %d", stage, k, tAsA_preslice.iterator, tAsA.iterator)
+
+                tBsB = tBsB_preslice[(None, stage)]
+                tBgB = tBgB_preslice[(None, k)]
+                
+                # Calculate proper TMA transfer size
+                a_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sA, (None, None, 0)))
+                b_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sB, (None, None, 0)))
+                total_transfer_size = a_transfer_size + b_transfer_size
+                
                 with cute.arch.elect_one():
                     mbarrier_expect_tx(mbars + stage, total_transfer_size)
-                    tma_load(tensormap_a_ptr, mbars + stage, sA_ptr+stage*8192, (k*64, bidy*128))
-                    tma_load(tensormap_b_ptr, mbars + stage, sB_ptr+stage*8192, (k*64, bidx*128))
-
-            # all threads will do mbarrier arrive 
+                
+                cute.copy(tma_atom_a, tAgA, tAsA, tma_bar_ptr=mbars + stage)
+                cute.copy(tma_atom_b, tBgB, tBsB, tma_bar_ptr=mbars + stage)
+            # all threads will arrive
             cute.arch.mbarrier_arrive(mbars + stage)
         # tile process
         # cute.arch.mbarrier_wait(mbars + ((k_tile_count-1) % stages) + stages, phase^1)
@@ -164,6 +206,9 @@ def matmul_fp8_nt_kernel(
         for k in cutlass.range_dynamic(k_tile_count):
             stage = k % stages
             phase = ((k % 6) // 3)
+            # if bidx == 0 and bidy == 0 and warp_idx % 4 == 0:
+            #     if tidx==0:
+            #         cute.printf("MMA waiting for Full mbar with stage %d, phase %d", stage, phase)
             cute.arch.mbarrier_wait(mbars + stage, phase)
             # if bidx == 0 and bidy == 0 and warp_idx % 4 == 0:
             #     if tidx==0:
@@ -187,9 +232,7 @@ def matmul_fp8_nt_kernel(
             cute.nvgpu.warpgroup.wait_group(0)
             cute.arch.mbarrier_arrive(mbars + stage + stages)
             
-        # tCgC.store(tCrC.load())
-        # atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gC.element_type)
-        # cute.copy(atom, tCrC, tCgC)   
+        # Store results back to global memory using proper tensor partitioning
 
         # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
         for i_1 in range(64):
@@ -203,8 +246,7 @@ def matmul_fp8_nt_kernel(
 def matmul_fp8_nt(
     mA: cute.Tensor,
     mB: cute.Tensor,
-    mC: cute.Tensor,
-    tensormaps: cute.Tensor,
+    mC: cute.Tensor
 ):
     cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk    
     sa_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64, cutlass.Float8E4M3FN)
@@ -256,7 +298,7 @@ def matmul_fp8_nt(
     # print(mA)
     # print(tma_tensor_a)
 
-    kernel = matmul_fp8_nt_kernel(tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, mC, tiled_mma, sa_layout_staged, sb_layout_staged, tensormaps)
+    kernel = matmul_fp8_nt_kernel(tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, mC, tiled_mma, sa_layout_staged, sb_layout_staged)
     # Launch with grid that covers the full output matrix
     # Grid: (M/128, N/128, 1), Block: (256, 1, 1) - corrected grid dimensions
     grid_x = (mC.shape[0] + 127) // 128  # M dimension
@@ -264,6 +306,7 @@ def matmul_fp8_nt(
     kernel.launch(grid=(grid_x, grid_y, 1), 
                   block=(256, 1, 1),
                   smem=SharedStorage.size_in_bytes())
+
 
 
 def create_and_permute_tensor(
@@ -332,12 +375,10 @@ a_f32, mA, a_torch = create_and_permute_tensor(M, K, False, cutlass.Float8E4M3FN
 b_f32, mB, b_torch = create_and_permute_tensor(N, K, False, cutlass.Float8E4M3FN)  # k-major
 c_f32, mC, c_torch = create_and_permute_tensor(M, N, False, cutlass.Float32)  # n-major
 
-tensormap_pytorch_tensor = (torch.empty((2,128//8),dtype=torch.int64).fill_(0).cuda())
-tensormap_cute_tensor = from_dlpack(tensormap_pytorch_tensor, assumed_align=16)
 
 # Compile kernel
-matmul_fp8_nt_ = cute.compile(matmul_fp8_nt, mA, mB, mC, tensormap_cute_tensor)
-matmul_fp8_nt_(mA, mB, mC, tensormap_cute_tensor)
+matmul_fp8_nt_ = cute.compile(matmul_fp8_nt, mA, mB, mC)
+matmul_fp8_nt_(mA, mB, mC)
 # print(mC)
 
 # Verify correctness - compare with torch reference
