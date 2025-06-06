@@ -82,7 +82,7 @@ def matmul_fp8_nt_kernel(
     gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))
 
 
-    thr_mma = tiled_mma.get_slice(0) # warpgroup id
+    thr_mma = tiled_mma.get_slice(tidx) # if use tma to store, pass warpgroup id * 128 instead.
 
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
@@ -204,14 +204,13 @@ def matmul_fp8_nt_kernel(
             cute.nvgpu.warpgroup.wait_group(0)
             cute.arch.mbarrier_arrive(mbars + stage + stages)
             
-        # Store results back to global memory using proper tensor partitioning
+        # Store results back to global memory using TenserSSA 
+        tCgC.store(tCrC.load())
 
-        # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
-        for i_1 in range(64):
-            C_offset = bidy * 131072 + (i_1 >> 5) * 65536 + (((tidx >> 5) * 16384)) + ((i_1 & 1) * 8192) + ((((tidx & 31) >> 2) * 1024)) + (bidx * 128) + (((i_1 & 31) >> 1) * 8) + (((tidx & 3) * 2))
-            tC = cute.make_tensor(gC.iterator + C_offset, 2)
-            rC = cute.make_tensor(tCrC.iterator + i_1 * 2, 2)
-            tC.store(rC.load())
+        # old cutlass style
+        # atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gC.element_type)
+        # tiled_atom = cute.make_tiled_copy_C_atom(atom, tiled_mma)
+        # cute.copy(tiled_atom, tCrC, tCgC)   
 
 
 @cute.jit

@@ -79,11 +79,13 @@ def matmul_fp8_nt_kernel(
     gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))    
     # print("gC_local", gC_local.layout)
 
-    thr_mma = tiled_mma.get_slice(0) # warpgroup id
+    thr_mma = tiled_mma.get_slice(tidx) # if use tma to store, pass warpgroup id * 128 instead.
+    # print(tiled_mma)
+    # print(thr_mma)
 
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
-    tCgC = thr_mma.partition_C(gC_local)
+    tCgC = thr_mma.partition_C(gC_local) 
 
     tCrA = thr_mma.make_fragment_A(tCsA)
     tCrB = thr_mma.make_fragment_B(tCsB)    
@@ -183,10 +185,14 @@ def matmul_fp8_nt_kernel(
             # Wait for all WGMMA operations to complete
             cute.nvgpu.warpgroup.wait_group(0)
             cute.arch.mbarrier_arrive(mbars + stage + stages)
-            
+
+        # Store results back to global memory using TenserSSA 
         # tCgC.store(tCrC.load())
+
+        # old cutlass style
         # atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gC.element_type)
-        # cute.copy(atom, tCrC, tCgC)   
+        # tiled_atom = cute.make_tiled_copy_C_atom(atom, tiled_mma)
+        # cute.copy(tiled_atom, tCrC, tCgC)   
 
         # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
         for i_1 in range(64):
