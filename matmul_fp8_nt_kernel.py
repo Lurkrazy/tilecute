@@ -8,7 +8,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.runtime import from_dlpack
 from utils.mbar import mbarrier_expect_tx
-from utils.cpsync import tma_load
+from utils.cpasync import tma_load
 
 stages = 3
 cta_tile_shape_mnk = (128, 128, 64)
