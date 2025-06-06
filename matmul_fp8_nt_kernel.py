@@ -89,8 +89,6 @@ def matmul_fp8_nt_kernel(
     tCrB = thr_mma.make_fragment_B(tCsB)    
     tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
 
-    
-
     mbars = storage.bar.data_ptr()
     sA_ptr = storage.sA.data_ptr()
     sB_ptr = storage.sB.data_ptr()
@@ -108,7 +106,6 @@ def matmul_fp8_nt_kernel(
 
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier() # equivalent to __syncthreads()
-
 
     # Calculate number of K tiles
     k_tile_count = 16  # K dimension tiles

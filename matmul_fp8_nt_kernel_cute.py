@@ -65,20 +65,14 @@ def matmul_fp8_nt_kernel(
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
     
-    # Define tile sizes - 128x128x64 CTA tile
-    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
-    
-    thr_mma = tiled_mma.get_slice(0) # warpgroup id
-    # print(tiled_mma)
-    # print(thr_mma)
-
     # Create shared memory allocator
     smem_alloc = cutlass.utils.SmemAllocator()
     storage = smem_alloc.allocate(SharedStorage)
 
     sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
     sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
-
+    # Define tile sizes - 128x128x64 CTA tile
+    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
     # print("sA", sA.layout)
     # print("sB", sB.layout)
 
@@ -88,33 +82,16 @@ def matmul_fp8_nt_kernel(
     gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))
 
 
+    thr_mma = tiled_mma.get_slice(0) # warpgroup id
+
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
-
-    # print("tCsA", tCsA.layout)
-    # print("tCsB", tCsB.layout)
-    # tC = cute.make_layout((8,16))
-    # tCgC = cute.local_partition(gC_local, (cta_tile_m, cta_tile_n), (bidy, bidx))
     tCgC = thr_mma.partition_C(gC_local)
-    # print("tCgC", tCgC.layout)
-    # C_layout = cute.make_layout(((2,2,16),2,1),stride=((1,2,4),64,0))
-    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
-    # tCrC = thr_mma.make_fragment_C(tCgC)
-
 
     tCrA = thr_mma.make_fragment_A(tCsA)
-    tCrB = thr_mma.make_fragment_B(tCsB)
-    # print("tCrA", tCrA.layout)
-    # print("tCrB", tCrB.layout)
-    # Calculate proper accumulator size based on tiled MMA
-  
-    # acc_shape = tCgC.shape
-    # print(acc_shape)
-    # C_local = cute.make_fragment(acc_shape, cutlass.Float32)
+    tCrB = thr_mma.make_fragment_B(tCsB)    
+    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
 
-    # Compute global tensor coordinates for this CTA
-    # tile_coord_mn = (bidy, bidx)  # Fixed: was (bidx, bidy)
-    
     # Create shared memory tensors
     tAsA_preslice, tAgA_preslice = cute.nvgpu.cpasync.tma_partition(
         tma_atom_a,
@@ -138,7 +115,6 @@ def matmul_fp8_nt_kernel(
 
     mbars = storage.bar.data_ptr()
 
-
     # Initialize barriers only once per warp group
     if warp_idx == 0:
         with cute.arch.elect_one():
@@ -147,8 +123,6 @@ def matmul_fp8_nt_kernel(
 
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier() # equivalent to __syncthreads()
-
-
 
     # Calculate number of K tiles
     k_tile_count = 16  # K dimension tiles
@@ -173,8 +147,6 @@ def matmul_fp8_nt_kernel(
             if warp_idx % 4 == 0: 
                 tAsA = tAsA_preslice[(None, stage)]
                 tAgA = tAgA_preslice[(None, k)]
-                if tidx%128==0:
-                    cute.printf("stage: %d, K: %d, tAsA_preslice: %d, tAsA: %d", stage, k, tAsA_preslice.iterator, tAsA.iterator)
 
                 tBsB = tBsB_preslice[(None, stage)]
                 tBgB = tBgB_preslice[(None, k)]
