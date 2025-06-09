@@ -24,6 +24,10 @@ def elementwise_add_kernel(
         offset_B = bidy * 131072 + i * 2048 + (tidx >> 6) * 1024 + bidx * 256 + (tidx & 63) * 4
         offset_C = bidy * 131072 + i * 2048 + (tidx >> 6) * 1024 + bidx * 256 + (tidx & 63) * 4
 
+        offset_A = cute.assume(offset_A, divby = 4)
+        offset_B = cute.assume(offset_B, divby = 4)
+        offset_C = cute.assume(offset_C, divby = 4)
+
         tA = cute.make_tensor(gA.iterator + offset_A, (4))
         tB = cute.make_tensor(gB.iterator + offset_B, (4))
         tC = cute.make_tensor(gC.iterator + offset_C, (4))

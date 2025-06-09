@@ -63,59 +63,17 @@ def matmul_fp8_nt_kernel(
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     warp_group_idx = warp_idx // 4
 
-    if warp_idx == 0:
-        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
-        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
-
     # Create shared memory allocator
     smem_alloc = cutlass.utils.SmemAllocator()
     storage = smem_alloc.allocate(SharedStorage)
 
-    sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-    sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)    
-    # Define tile sizes - 128x128x64 CTA tile
-    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
-
-    gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))    
-    # print("gC_local", gC_local.layout)
-
-    thr_mma = tiled_mma.get_slice(tidx) # if use tma to store, pass warpgroup id * 128 instead.
-    # print(tiled_mma)
-    # print(thr_mma)
-
-    tCsA = thr_mma.partition_A(sA)
-    tCsB = thr_mma.partition_B(sB)
-    tCgC = thr_mma.partition_C(gC_local) 
-
-    tCrA = thr_mma.make_fragment_A(tCsA)
-    tCrB = thr_mma.make_fragment_B(tCsB)    
-    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
-
-    mbars = storage.bar.data_ptr()
-    sA_ptr = storage.sA.data_ptr()
-    sB_ptr = storage.sB.data_ptr()
-
+    # init tensormap ptr
     tensormap_mgr = cutlass.utils.TensorMapManager(cutlass.utils.TensorMapUpdateMode.GMEM, 128)
 
     tensormap_a_ptr = tensormap_mgr.get_tensormap_ptr(tensormaps[(0, None)].iterator)
     tensormap_b_ptr = tensormap_mgr.get_tensormap_ptr(tensormaps[(1, None)].iterator)
 
-    # Initialize barriers only once per warp group
-    if warp_idx == 0:
-        with cute.arch.elect_one():
-            for i in range(stages * 2):
-                cute.arch.mbarrier_init_arrive_cnt(mbars + i, 128)
-
-    cute.arch.mbarrier_init_fence()
-    cute.arch.barrier() # equivalent to __syncthreads()
-
-    # Calculate number of K tiles
-    k_tile_count = 16  # K dimension tiles
-    # print("k_tile_count", k_tile_count)
-
-    # TMA warpgroup
-    if warp_group_idx == 1: 
-        cute.arch.warpgroup_reg_dealloc(24)
+    if warp_group_idx == 1:
         tensormap_mgr.init_tensormap_from_atom(
             tma_atom_a,
             tensormap_a_ptr,
@@ -129,12 +87,48 @@ def matmul_fp8_nt_kernel(
         # warp_group_sync
         cute.arch.barrier(barrier_id=1, number_of_threads=128) 
         tensormap_mgr.fence_tensormap_initialization()
-        # Calculate proper TMA transfer size
-        a_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sA, (None, None, 0)))
-        b_transfer_size = cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(sB, (None, None, 0)))
-        total_transfer_size = a_transfer_size + b_transfer_size
-        
-        # phase = 0
+
+    # get smem tensor
+    sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+    sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)  
+
+    # Define tile sizes - 128x128x64 CTA tile
+    cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
+
+    gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))    
+    # print("gC_local", gC_local.layout)
+
+    thr_mma = tiled_mma.get_slice(tidx) # if use tma to store, pass warpgroup id * 128 instead.
+
+    tCsA = thr_mma.partition_A(sA)
+    tCsB = thr_mma.partition_B(sB)
+    tCgC = thr_mma.partition_C(gC_local) 
+
+    tCrA = thr_mma.make_fragment_A(tCsA)
+    tCrB = thr_mma.make_fragment_B(tCsB)    
+    tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
+
+    mbars = storage.bar.data_ptr()
+    sA_ptr = storage.sA.data_ptr()
+    sB_ptr = storage.sB.data_ptr()
+
+    # Initialize barriers only once per warp group
+    if warp_idx == 0:
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+        with cute.arch.elect_one():
+            for i in range(stages * 2):
+                cute.arch.mbarrier_init_arrive_cnt(mbars + i, 128)
+
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads() # equivalent to __syncthreads()
+
+    # Calculate number of K tiles
+    k_tile_count = 16  # K dimension tiles
+
+    # TMA warpgroup
+    if warp_group_idx == 1: 
+        cute.arch.warpgroup_reg_dealloc(24)
         for k in cutlass.range_dynamic(k_tile_count):
             stage = k % stages
             phase = ((k % 6) // 3) ^ 1
@@ -142,48 +136,35 @@ def matmul_fp8_nt_kernel(
 
             if warp_idx % 4 == 0: 
                 with cute.arch.elect_one():
-                    mbarrier_expect_tx(mbars + stage, total_transfer_size)
+                    mbarrier_expect_tx(mbars + stage, 8192)
                     tma_load(tensormap_a_ptr, mbars + stage, sA_ptr+stage*8192, (k*64, bidy*128))
+                    mbarrier_expect_tx(mbars + stage, 8192)
                     tma_load(tensormap_b_ptr, mbars + stage, sB_ptr+stage*8192, (k*64, bidx*128))
 
             # all threads will do mbarrier arrive 
             cute.arch.mbarrier_arrive(mbars + stage)
-        # tile process
-        # cute.arch.mbarrier_wait(mbars + ((k_tile_count-1) % stages) + stages, phase^1)
     elif warp_group_idx == 0: # gemm warp group
         cute.arch.warpgroup_reg_alloc(240)
         tCrC.fill(0.0)
         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
-            )
-        # num_k_blocks = cute.size(tCrA, mode=[2])
-        # print(num_k_blocks)
+        cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared,
+                              space=cute.arch.SharedSpace.shared_cta)
         for k in cutlass.range_dynamic(k_tile_count):
             stage = k % stages
             phase = ((k % 6) // 3)
             cute.arch.mbarrier_wait(mbars + stage, phase)
-            # if bidx == 0 and bidy == 0 and warp_idx % 4 == 0:
-            #     if tidx==0:
-            #         cute.printf("MMA acquired Full mbar with stage %d, phase %d", stage, phase)
+            # gemm_ss
             cute.nvgpu.warpgroup.fence()
-            # tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-            # k_block_coor = (None, None, None, k % 3)
-            # cute.gemm(tiled_mma, tCrC, tCsA[k_block_coor], tCsB[k_block_coor], tCrC)
             num_k_blocks = cute.size(tCrA, mode=[2])
             for k_block in range(num_k_blocks):
                 k_block_coor = (None, None, k_block, stage)
                 tCrA_1phase = tCrA[k_block_coor]
                 tCrB_1phase = tCrB[k_block_coor]
-                # print("tCrA_1phase", tCrA_1phase.layout)
-                # print("tCrB_1phase", tCrB_1phase.layout)
-                # print("tCrC", tCrC.layout)
                 cute.gemm(tiled_mma, tCrC, tCrA_1phase, tCrB_1phase, tCrC)
                 # tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
             cute.nvgpu.warpgroup.commit_group()
-            # Wait for all WGMMA operations to complete
             cute.nvgpu.warpgroup.wait_group(0)
+
             cute.arch.mbarrier_arrive(mbars + stage + stages)
 
         # Store results back to global memory using TenserSSA 
@@ -196,9 +177,10 @@ def matmul_fp8_nt_kernel(
 
         # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
         for i_1 in range(64):
-            C_offset = bidy * 131072 + (i_1 >> 5) * 65536 + (((tidx >> 5) * 16384)) + ((i_1 & 1) * 8192) + ((((tidx & 31) >> 2) * 1024)) + (bidx * 128) + (((i_1 & 31) >> 1) * 8) + (((tidx & 3) * 2))
-            tC = cute.make_tensor(gC.iterator + C_offset, 2)
-            rC = cute.make_tensor(tCrC.iterator + i_1 * 2, 2)
+            gC_offset = bidy * 131072 + (i_1 >> 5) * 65536 + (((tidx >> 5) * 16384)) + ((i_1 & 1) * 8192) + ((((tidx & 31) >> 2) * 1024)) + (bidx * 128) + (((i_1 & 31) >> 1) * 8) + (((tidx & 3) * 2))
+            gC_offset = cute.assume(gC_offset, divby = 2)
+            tC = cute.make_tensor(gC.iterator + gC_offset, 2)
+            rC = cute.make_tensor(tCrC.iterator + i_1*2, 2)
             tC.store(rC.load())
 
 

@@ -48,7 +48,7 @@ def tma_load(
         im2col_offsets = [],
         load_mode = nvvm.CpAsyncBulkTensorLoadMode.TILE,
         group = nvvm.Tcgen05GroupKind.CTA_1,
-        use_intrinsic=False, # set to True would lead to compile error
+        use_intrinsic = False, # set to True would lead to compile error
         loc=loc,
         ip=ip
     )
