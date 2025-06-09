@@ -168,12 +168,11 @@ def matmul_fp8_nt_kernel(
             cute.arch.mbarrier_arrive(mbars + stage + stages)
 
         # Store results back to global memory using TenserSSA 
-        # tCgC.store(tCrC.load())
+        # tCgC_view = cute.make_tensor(tCgC.iterator.align(8), tCgC.layout)
+        # tCgC_view.store(tCrC.load())
 
         # old cutlass style
-        # atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gC.element_type)
-        # tiled_atom = cute.make_tiled_copy_C_atom(atom, tiled_mma)
-        # cute.copy(tiled_atom, tCrC, tCgC)   
+        # cute.autovec_copy(tCrC, tCgC_view)   
 
         # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
         for i_1 in range(64):
