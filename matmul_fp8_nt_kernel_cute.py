@@ -73,13 +73,14 @@ def matmul_fp8_nt_kernel(
     sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
     # Define tile sizes - 128x128x64 CTA tile
     cta_tile_m, cta_tile_n, cta_tile_k = cta_tile_shape_mnk
+    tile_coord_mnk = (bidy, bidx, None)
     # print("sA", sA.layout)
     # print("sB", sB.layout)
 
     # Local tile the global tensors
-    gA_local = cute.local_tile(gA, (cta_tile_m, cta_tile_k), (bidy, None))
-    gB_local = cute.local_tile(gB, (cta_tile_n, cta_tile_k), (bidx, None))
-    gC_local = cute.local_tile(gC, (cta_tile_m, cta_tile_n), (bidy, bidx))
+    gA_local = cute.local_tile(gA, cta_tile_shape_mnk, tile_coord_mnk, proj = (1, None, 1))
+    gB_local = cute.local_tile(gB, cta_tile_shape_mnk, tile_coord_mnk, proj = (None, 1, 1))
+    gC_local = cute.local_tile(gC, cta_tile_shape_mnk, tile_coord_mnk, proj = (1, 1, None))
 
     thr_mma = tiled_mma.get_slice(tidx) # if use tma to store, pass warpgroup id * 128 instead.
 
@@ -90,9 +91,13 @@ def matmul_fp8_nt_kernel(
     tCrA = thr_mma.make_fragment_A(tCsA)
     tCrB = thr_mma.make_fragment_B(tCsB)    
     tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
-    # tCrA = tiled_mma.make_fragment_A(tCsA)
-    # tCrB = tiled_mma.make_fragment_B(tCsB)
-    # tCrC = tiled_mma.make_fragment_C(tCgC)
+    
+    print("gC_local.iterator:", gC_local.iterator)
+    print("gC_local.iterator.max_alignment:", gC_local.iterator.max_alignment)
+    print("tCgC.iterator:", tCgC.iterator)
+    print("tCgC.iterator.max_alignment:", tCgC.iterator.max_alignment)
+    print("tCgC.layout:", tCgC.layout)
+    print("tCgC.layout.max_alignment:", tCgC.layout.max_alignment)
     
     # tCrC = cute.make_fragment_like(tCgC)
     # print("gC.layout", gC.layout)
