@@ -52,3 +52,52 @@ def tma_load(
         loc=loc,
         ip=ip
     )
+
+@dsl_user_op
+def cp_async_shared_global(
+    dst: Pointer, src: Pointer, cp_size: Int, modifier: nvvm.LoadCacheModifierKind, *, src_size: Int = None, loc=None, ip=None
+) -> None:
+    """
+    Asynchronously copy data from global memory to shared memory.
+
+    :param dst: Destination pointer in shared memory
+    :type dst: Pointer
+    :param src: Source pointer in global memory
+    :type src: Pointer
+    :param size: Size of the copy in bytes
+    :type size: Int
+    :param modifier: Cache modifier
+    :type modifier: Int
+    :param cp_size: Optional copy size override
+    :type cp_size: Int
+    """
+    size = src_size if src_size else cp_size
+    nvvm.cp_async_shared_global(
+        dst=dst.llvm_ptr,
+        src=src.llvm_ptr,
+        size=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), size),
+        modifier=modifier,
+        cp_size=Int32(cp_size).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip
+    )
+
+
+@dsl_user_op
+def cp_async_mbarrier_arrive_shared(
+    addr: Pointer, *, noinc: Boolean = False, loc=None, ip=None
+) -> None:
+    """
+    Arrive on a mbarrier in shared memory.
+
+    :param addr: Pointer to mbarrier in shared memory
+    :type addr: Pointer
+    :param noinc: Whether to not increment the mbarrier
+    :type noinc: Boolean
+    """
+    nvvm.cp_async_mbarrier_arrive_shared(
+        addr=addr.llvm_ptr,
+        noinc=ir.IntegerAttr.get(ir.IntegerType.get_signless(1), noinc) if noinc else None,
+        loc=loc,
+        ip=ip
+    )

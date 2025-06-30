@@ -92,12 +92,12 @@ def matmul_fp8_nt_kernel(
     tCrB = thr_mma.make_fragment_B(tCsB)    
     tCrC = cute.make_fragment(tCgC.shape, cutlass.Float32)
     
-    print("gC_local.iterator:", gC_local.iterator)
-    print("gC_local.iterator.max_alignment:", gC_local.iterator.max_alignment)
-    print("tCgC.iterator:", tCgC.iterator)
-    print("tCgC.iterator.max_alignment:", tCgC.iterator.max_alignment)
-    print("tCgC.layout:", tCgC.layout)
-    print("tCgC.layout.max_alignment:", tCgC.layout.max_alignment)
+    # print("gC_local.iterator:", gC_local.iterator)
+    # print("gC_local.iterator.max_alignment:", gC_local.iterator.max_alignment)
+    # print("tCgC.iterator:", tCgC.iterator)
+    # print("tCgC.iterator.max_alignment:", tCgC.iterator.max_alignment)
+    # print("tCgC.layout:", tCgC.layout)
+    # print("tCgC.layout.max_alignment:", tCgC.layout.max_alignment)
     
     # tCrC = cute.make_fragment_like(tCgC)
     # print("gC.layout", gC.layout)
@@ -360,12 +360,17 @@ a_f32, mA, a_torch = create_and_permute_tensor(M, K, False, cutlass.Float8E4M3FN
 b_f32, mB, b_torch = create_and_permute_tensor(N, K, False, cutlass.Float8E4M3FN)  # k-major
 c_f32, mC, c_torch = create_and_permute_tensor(M, N, False, cutlass.Float32)  # n-major
 
+# == benchmark ==
+import time
+import cuda.bindings.driver as cuda
 
-# Compile kernel
+print("Compiling kernel with cute.compile ...")
+start_time = time.time()
 matmul_fp8_nt_ = cute.compile(matmul_fp8_nt, mA, mB, mC)
-matmul_fp8_nt_(mA, mB, mC)
-# print(mC)
+compilation_time = time.time() - start_time
+print(f"Compilation time: {compilation_time:.4f} seconds")
 
+matmul_fp8_nt_(mA, mB, mC)
 # Verify correctness - compare with torch reference
 # Fixed: No need to transpose B since both A and B are k-major
 c_ref = torch.matmul(a_f32, b_f32.T)
@@ -376,3 +381,42 @@ print(f"diff: {diff}")
 print("FP8 GEMM kernel test passed!")
 # torch.testing.assert_close(c_torch.cpu(), c_ref, rtol=1e-2, atol=1e-2)  # Lower tolerance for fp8
 # print("FP8 GEMM kernel test passed!")
+
+print("Executing GEMM kernel...")
+# Get current CUDA stream from PyTorch
+torch_stream = torch.cuda.current_stream()
+
+# Get the raw stream pointer as a CUstream
+current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+# Create CUDA events for timing
+start_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
+end_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
+
+warmup_iterations = 10
+iterations = 100
+# Warmup
+for _ in range(warmup_iterations):
+    matmul_fp8_nt_(mA, mB, mC)
+
+# Use the current stream for CUDA events instead of the default stream
+# Record start event
+cuda.cuEventRecord(start_event, current_stream)
+
+# Execute the kernel
+for _ in range(iterations):
+    matmul_fp8_nt_(mA, mB, mC)
+
+# Record end event
+cuda.cuEventRecord(end_event, current_stream)
+cuda.cuEventSynchronize(end_event)
+
+# Calculate elapsed time
+err, elapsed_time = cuda.cuEventElapsedTime(start_event, end_event)
+
+# Print execution results
+print(f"Kernel execution time: {elapsed_time / iterations:.4f} ms")
+
+# Destroy events
+cuda.cuEventDestroy(start_event)
+cuda.cuEventDestroy(end_event)
