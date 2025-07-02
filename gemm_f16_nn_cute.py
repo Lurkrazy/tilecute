@@ -59,7 +59,7 @@ def _make_smem_layout_AB(dtype, major_mode, copy_bits, smem_tiler):
         0,
         layout_atom_outer,
     )
-    layout = cute.tile_to_shape(layout_atom, smem_tiler, (0, 1) if is_row_major else (1, 0))
+    layout = cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2) if is_row_major else (1, 0, 2))
     return layout
 
 @cute.jit
@@ -137,95 +137,62 @@ def gemm_f16f16f16_nn_kernel(
 ):
     tidx, tidy, tidz = cute.arch.thread_idx()
     bidx, bidy, bidz = cute.arch.block_idx()
+    bdimx, bdimy, bdimz = cute.arch.block_dim()
+
+    tiler_coord = (bidx, bidy, None)
     
     smem = cutlass.utils.SmemAllocator()
+
     smem_storage = smem.allocate_tensor(cutlass.Uint8, 32768, 128) # 1024 align
+
+    gA = cute.local_tile(mA[None,None,bidz], tiler=cta_tiler, coord=tiler_coord, proj=(1, None, 1))
+    gB = cute.local_tile(mB[None,None,bidz], tiler=cta_tiler, coord=tiler_coord, proj=(None, 1, 1))
+    gC = cute.local_tile(mC[None,None,bidz], tiler=cta_tiler, coord=tiler_coord, proj=(1, 1, None))
+
+    sA_storage = cute.make_tensor(cute.recast_ptr(smem_storage.iterator, dtype = cutlass.Float16), sA_layout)
+    sB_storage = cute.make_tensor(cute.recast_ptr(smem_storage.iterator, dtype = cutlass.Float16)+8192, sB_layout)
+    thr_copy_A = tiled_copy_A.get_slice(tidx)
+    thr_copy_B = tiled_copy_B.get_slice(tidx)
+
+    tAgA = thr_copy_A.partition_S(gA)
+    tBgB = thr_copy_B.partition_S(gB)
+    tAsA = thr_copy_A.partition_D(sA_storage)
+    tBsB = thr_copy_B.partition_D(sB_storage)    
 
     C_local = cute.make_fragment(128, cutlass.Float16)
 
     C_local.fill(0)
 
-    bidx, bidy = bidy, bidx # swap bidx and bidy to match tilelang grid
-
-    for i_1 in range(4):
-
-        smem_offset = ((((i_1 * 2048) + (((tidx) >> 2) * 64)) + ((((((tidx) & 31) >> 4) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 15) >> 3) + ((tidx) & 1)) & 1) * 16))
-        
-        global_offset = (((((bidy) * 98304) + (i_1 * 24576)) + (((tidx) >> 2) * 768)) + (((tidx) & 3) * 8))
-
-        cp_async_shared_global(
-            dst = smem_storage.iterator + smem_offset,
-            src = mA.iterator + global_offset, 
-            cp_size = 16,
-            modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-        )
-
-    for i_2 in range(4):
-        
-        smem_offset = ((((((((((tidx) & 15) >> 3) * 4096) + (i_2 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
-        
-        global_offset = ((((i_2 * 8192) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8))
-
-        cp_async_shared_global(
-            dst = smem_storage.iterator + smem_offset,
-            src = mB.iterator + global_offset, 
-            cp_size = 16,
-            modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-        )
-
+    cute.copy(tiled_copy_A, tAgA[None, None, None, 0], tAsA[None, None, None, 0])
+    cute.copy(tiled_copy_B, tBgB[None, None, None, 0], tBsB[None, None, None, 0])
 
     cute.arch.cp_async_commit_group()
 
     for k in cutlass.range_dynamic(23): 
         cute.arch.sync_threads()
 
-        for i_3 in range(4):
-
-            smem_offset = (((((((k + 1) & 1) * 8192) + (i_3 * 2048)) + (((tidx) >> 2) * 64)) + ((((((tidx) & 31) >> 4) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 15) >> 3) + ((tidx) & 1)) & 1) * 16))
-
-            global_offset = (((((((bidy) * 98304) + (i_3 * 24576)) + (((tidx) >> 2) * 768)) + (k * 32)) + (((tidx) & 3) * 8)) + 32)
-
-            cp_async_shared_global(
-                dst = smem_storage.iterator + smem_offset,
-                src = mA.iterator + global_offset, 
-                cp_size = 16,
-                modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-            )
-        
-        for i_4 in range(4):
-
-            smem_offset = ((((((((((k + 1) & 1) * 8192) + ((((tidx) & 15) >> 3) * 4096)) + (i_4 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
-
-            global_offset = ((((((k * 32768) + (i_4 * 8192)) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8)) + 32768)
-
-            cp_async_shared_global(
-                dst = smem_storage.iterator + smem_offset,
-                src = mB.iterator + global_offset, 
-                cp_size = 16,
-                modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-            )
+        cute.copy(tiled_copy_A, tAgA[None, None, None, k+1], tAsA[None, None, None, (k+1) & 1])
+        cute.copy(tiled_copy_B, tBgB[None, None, None, k+1], tBsB[None, None, None, (k+1) & 1])
 
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(1)
         cute.arch.sync_threads()
 
-        sA = cute.make_tensor(cute.recast_ptr(smem_storage.iterator,dtype = cutlass.Float16)+((k & 1) * 4096), sA_layout)
-        sB = cute.make_tensor(cute.recast_ptr(smem_storage.iterator,dtype = cutlass.Float16)+(((k & 1) * 4096) + 8192), sB_layout)
+        sA = sA_storage[None, None, (k & 1)]
+        sB = sB_storage[None, None, (k & 1)]
         gemm_ss(sA, sB, C_local, tiled_mma)
 
     cute.arch.cp_async_wait_group(0)
     cute.arch.sync_threads()
 
-    sA = cute.make_tensor(cute.recast_ptr(smem_storage.iterator, dtype = cutlass.Float16) + 4096, sA_layout)
-    sB = cute.make_tensor(cute.recast_ptr(smem_storage.iterator, dtype = cutlass.Float16) + 12288, sB_layout)
+    sA = sA_storage[None, None, 1]
+    sB = sB_storage[None, None, 1]
     gemm_ss(sA, sB, C_local, tiled_mma)
 
-    for i_5 in range(64):
-        global_offset = ((((((((((bidy) * 131072) + (((i_5 & 7) >> 1) * 32768)) + ((((tidx) & 63) >> 5) * 16384)) + ((i_5 & 1) * 8192)) + ((((tidx) & 31) >> 2) * 1024)) + ((bidx) * 128)) + ((i_5 >> 3) * 16)) + (((tidx) >> 6) * 8)) + (((tidx) & 3) * 2))
-        global_offset = cute.assume(global_offset, divby=2)
-        tC = cute.make_tensor(mC.iterator + global_offset, 2)
-        rC = cute.make_tensor(C_local.iterator + i_5 * 2, 2)
-        tC.store(rC.load())
+    tCrC = cute.make_tensor(C_local.iterator, tiled_mma.partition_shape_C((cta_tiler[0], cta_tiler[1])))
+    thr_mma = tiled_mma.get_slice(tidx)
+    tCgC = thr_mma.partition_C(gC)
+    cute.autovec_copy(tCrC, tCgC)
 
 @cute.jit
 def gemm_f16f16f16_nn(
@@ -235,9 +202,10 @@ def gemm_f16f16f16_nn(
 ):
 
     cta_tile_m, cta_tile_n, cta_tile_k = cta_tiler    
+    stage_num = 2
 
-    sA_layout = _make_smem_layout_AB(cutlass.Float16, a_major_mode, 128, (cta_tile_m, cta_tile_k))
-    sB_layout = _make_smem_layout_AB(cutlass.Float16, b_major_mode, 128, (cta_tile_n, cta_tile_k))
+    sA_layout = _make_smem_layout_AB(cutlass.Float16, a_major_mode, 128, (cta_tile_m, cta_tile_k, stage_num))
+    sB_layout = _make_smem_layout_AB(cutlass.Float16, b_major_mode, 128, (cta_tile_n, cta_tile_k, stage_num))
 
     atom_async_copy = cute.make_copy_atom(
         cute.nvgpu.cpasync.CopyG2SOp(
@@ -297,6 +265,7 @@ torch.manual_seed(0)
 a = create_and_permute_tensor(L, M, K, a_major == "m", cutlass_torch.dtype(ab_dtype))
 b = create_and_permute_tensor(L, N, K, b_major == "n", cutlass_torch.dtype(ab_dtype))
 c = create_and_permute_tensor(L, M, N, c_major == "m", cutlass_torch.dtype(c_dtype))
+
 
 # assume input is 16B aligned
 mA = (
