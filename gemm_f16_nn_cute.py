@@ -228,7 +228,6 @@ def gemm_f16f16f16_nn(
     )
     tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
 
-    # kernel = tensorop_kernel(mA, mB, mC, sA_layout, sB_layout, tiled_copy_A, tiled_copy_B, tiled_mma)
     kernel = gemm_f16f16f16_nn_kernel(mA, mB, mC, sA_layout, sB_layout, tiled_copy_A, tiled_copy_B, tiled_mma)
     
     # Launch with grid that covers the full output matrix

@@ -16,27 +16,6 @@ cta_tiler = (128, 128, 32)
 a_major_mode = cutlass.utils.LayoutEnum.ROW_MAJOR
 b_major_mode = cutlass.utils.LayoutEnum.COL_MAJOR
 
-
-def _make_gmem_tiled_copy_AB(atom_copy, dtype, major_mode, copy_bits):
-    copy_elems = copy_bits // dtype.width
-    shape_dim_1 = cute.size(32) // copy_elems
-    # thread layout for copy
-    thread_layout = cute.make_layout(
-        (128 // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
-    )
-    if major_mode != cutlass.utils.LayoutEnum.ROW_MAJOR:
-        shape_dim_0 = cute.size(128) // copy_elems
-        thread_layout = cute.make_layout(
-            (shape_dim_0, 128 // shape_dim_0), stride=(1, shape_dim_0)
-        )
-    # Value layout for copy
-    value_layout = (
-        cute.make_layout((1, copy_elems))
-        if major_mode == cutlass.utils.LayoutEnum.ROW_MAJOR
-        else cute.make_layout((copy_elems, 1))
-    )
-    return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
-
 def _make_smem_layout_AB(dtype, major_mode, copy_bits, smem_tiler):
     # print(smem_tiler)
     is_row_major = major_mode == cutlass.utils.LayoutEnum.ROW_MAJOR
@@ -131,8 +110,6 @@ def gemm_f16f16f16_nn_kernel(
     mC: cute.Tensor,
     sA_layout: cute.ComposedLayout,
     sB_layout: cute.ComposedLayout,
-    tiled_copy_A: cute.TiledCopy,
-    tiled_copy_B: cute.TiledCopy,
     tiled_mma: cute.TiledMma,
 ):
     tidx, tidy, tidz = cute.arch.thread_idx()
@@ -239,16 +216,6 @@ def gemm_f16f16f16_nn(
     sA_layout = _make_smem_layout_AB(cutlass.Float16, a_major_mode, 128, (cta_tile_m, cta_tile_k))
     sB_layout = _make_smem_layout_AB(cutlass.Float16, b_major_mode, 128, (cta_tile_n, cta_tile_k))
 
-    atom_async_copy = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(
-            cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-        ),
-        mA.element_type,
-        num_bits_per_copy=128,
-    )
-    tiled_copy_A = _make_gmem_tiled_copy_AB(atom_async_copy, mA.element_type, a_major_mode, 128)
-    tiled_copy_B = _make_gmem_tiled_copy_AB(atom_async_copy, mB.element_type, b_major_mode, 128)
-
     num_warp = (2, 2, 1)
     inst_shape = (16, 8, 16)
     op = cute.nvgpu.warp.MmaF16BF16Op(cutlass.Float16, cutlass.Float16, inst_shape )
@@ -260,8 +227,7 @@ def gemm_f16f16f16_nn(
     )
     tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
 
-    # kernel = tensorop_kernel(mA, mB, mC, sA_layout, sB_layout, tiled_copy_A, tiled_copy_B, tiled_mma)
-    kernel = gemm_f16f16f16_nn_kernel(mA, mB, mC, sA_layout, sB_layout, tiled_copy_A, tiled_copy_B, tiled_mma)
+    kernel = gemm_f16f16f16_nn_kernel(mA, mB, mC, sA_layout, sB_layout, tiled_mma)
     
     # Launch with grid that covers the full output matrix
     kernel.launch(grid=(4, 8, 1),   # tilelang grid is N,M,L -> X,Y,Z
