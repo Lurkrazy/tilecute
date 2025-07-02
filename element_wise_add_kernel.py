@@ -19,7 +19,7 @@ def elementwise_add_kernel(
     #   float4 v_ = *(float4*)(A + (((((((int)blockIdx.y) * 131072) + (i * 2048)) + ((((int)threadIdx.x) >> 6) * 1024)) + (((int)blockIdx.x) * 256)) + ((((int)threadIdx.x) & 63) * 4)));
     #   float4 v__1 = *(float4*)(B + (((((((int)blockIdx.y) * 131072) + (i * 2048)) + ((((int)threadIdx.x) >> 6) * 1024)) + (((int)blockIdx.x) * 256)) + ((((int)threadIdx.x) & 63) * 4)));
     # *(uint2*)(C + (((((((int)blockIdx.y) * 131072) + (i * 2048)) + ((((int)threadIdx.x) >> 6) * 1024)) + (((int)blockIdx.x) * 256)) + ((((int)threadIdx.x) & 63) * 4))) 
-    for i in range(0, 64):
+    for i in cutlass.range_constexpr(64):
         offset_A = bidy * 131072 + i * 2048 + (tidx >> 6) * 1024 + bidx * 256 + (tidx & 63) * 4
         offset_B = bidy * 131072 + i * 2048 + (tidx >> 6) * 1024 + bidx * 256 + (tidx & 63) * 4
         offset_C = bidy * 131072 + i * 2048 + (tidx >> 6) * 1024 + bidx * 256 + (tidx & 63) * 4

@@ -124,7 +124,7 @@ def gemm_f16f16f16_nn_kernel(
 
     bidx, bidy = bidy, bidx # swap bidx and bidy to match tilelang grid
 
-    for i_1 in range(4):
+    for i_1 in cutlass.range_constexpr(4):
 
         smem_offset = ((((i_1 * 2048) + (((tidx) >> 2) * 64)) + ((((((tidx) & 31) >> 4) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 15) >> 3) + ((tidx) & 1)) & 1) * 16))
         
@@ -137,7 +137,7 @@ def gemm_f16f16f16_nn_kernel(
             modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
         )
 
-    for i_2 in range(4):
+    for i_2 in cutlass.range_constexpr(4):
         
         smem_offset = ((((((((((tidx) & 15) >> 3) * 4096) + (i_2 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
         
@@ -156,7 +156,7 @@ def gemm_f16f16f16_nn_kernel(
     for k in cutlass.range_dynamic(23): 
         cute.arch.sync_threads()
 
-        for i_3 in range(4):
+        for i_3 in cutlass.range_constexpr(4):
 
             smem_offset = (((((((k + 1) & 1) * 8192) + (i_3 * 2048)) + (((tidx) >> 2) * 64)) + ((((((tidx) & 31) >> 4) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 15) >> 3) + ((tidx) & 1)) & 1) * 16))
 
@@ -169,7 +169,7 @@ def gemm_f16f16f16_nn_kernel(
                 modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
             )
         
-        for i_4 in range(4):
+        for i_4 in cutlass.range_constexpr(4):
 
             smem_offset = ((((((((((k + 1) & 1) * 8192) + ((((tidx) & 15) >> 3) * 4096)) + (i_4 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
 
@@ -197,7 +197,7 @@ def gemm_f16f16f16_nn_kernel(
     sB = cute.make_tensor(cute.recast_ptr(smem_storage.iterator, dtype = cutlass.Float16) + 12288, sB_layout)
     gemm_ss(sA, sB, C_local, tiled_mma)
 
-    for i_5 in range(64):
+    for i_5 in cutlass.range_constexpr(64):
         global_offset = ((((((((((bidy) * 131072) + (((i_5 & 7) >> 1) * 32768)) + ((((tidx) & 63) >> 5) * 16384)) + ((i_5 & 1) * 8192)) + ((((tidx) & 31) >> 2) * 1024)) + ((bidx) * 128)) + ((i_5 >> 3) * 16)) + (((tidx) >> 6) * 8)) + (((tidx) & 3) * 2))
         global_offset = cute.assume(global_offset, divby=2)
         tC = cute.make_tensor(mC.iterator + global_offset, 2)
@@ -313,7 +313,7 @@ print("max diff", torch.max(torch.abs(c.cpu() - c_ref.cpu())))
 torch.testing.assert_close(c.cpu(), c_ref.cpu(), atol=1e-3, rtol=1e-3)
 print("FP16 GEMM kernel test passed!")
 
-print("Executing GEMM kernel...")
+print("Executing FP16 GEMM kernel...")
 # Get current CUDA stream from PyTorch
 torch_stream = torch.cuda.current_stream()
 

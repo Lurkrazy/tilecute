@@ -174,8 +174,7 @@ def matmul_fp8_nt_kernel(
         # old cutlass style
         # cute.autovec_copy(tCrC, tCgC_view)   
 
-        # ((((((((((int)blockIdx.y) * 131072) + ((i_1 >> 5) * 65536)) + ((((int)threadIdx.x) >> 5) * 16384)) + ((i_1 & 1) * 8192)) + (((((int)threadIdx.x) & 31) >> 2) * 1024)) + (((int)blockIdx.x) * 128)) + (((i_1 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2))
-        for i_1 in range(64):
+        for i_1 in cutlass.range_constexpr(64):
             gC_offset = bidy * 131072 + (i_1 >> 5) * 65536 + (((tidx >> 5) * 16384)) + ((i_1 & 1) * 8192) + ((((tidx & 31) >> 2) * 1024)) + (bidx * 128) + (((i_1 & 31) >> 1) * 8) + (((tidx & 3) * 2))
             gC_offset = cute.assume(gC_offset, divby = 2)
             tC = cute.make_tensor(gC.iterator + gC_offset, 2)
@@ -205,8 +204,6 @@ def matmul_fp8_nt(
         sb_layout_atom, 
         (cta_tile_n, cta_tile_k, stages), 
         order=(0, 1, 2))
-    
-    # print(sa_layout_staged)
 
     mma_inst_shape_mnk = (64, 128, 32)
     atom_layout_mnk = (1, 1, 1)
@@ -219,26 +216,12 @@ def matmul_fp8_nt(
         cute.nvgpu.warpgroup.OperandMajorMode("K"),
         cute.nvgpu.warpgroup.OperandMajorMode("K"),
     )
-    # print(op)
     
     tiled_mma = cute.make_tiled_mma(cute.make_mma_atom(op), atom_layout_mnk)
-    # tiled_mma = sm90_utils.make_trivial_tiled_mma(
-    #     cutlass.Float8E4M3FN,
-    #     cutlass.Float8E4M3FN,
-    #     cute.nvgpu.warpgroup.OperandMajorMode("K"),
-    #     cute.nvgpu.warpgroup.OperandMajorMode("K"),
-    #     cutlass.Float32,
-    #     atom_layout_mnk,
-    #     (mma_inst_shape_mnk[0], mma_inst_shape_mnk[1])
-    # )
-    # print(tiled_mma)
     
     tma_atom_a, tma_tensor_a = _make_tma_atoms_and_tensors(mA, sa_layout_staged, (cta_tile_m, cta_tile_k), 1)
     tma_atom_b, tma_tensor_b = _make_tma_atoms_and_tensors(mB, sb_layout_staged, (cta_tile_n, cta_tile_k), 1)
 
-    # print(tma_atom_a)
-    # print(mA)
-    # print(tma_tensor_a)
 
     kernel = matmul_fp8_nt_kernel(tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, mC, tiled_mma, sa_layout_staged, sb_layout_staged, tensormaps)
     # Launch with grid that covers the full output matrix
@@ -319,18 +302,62 @@ c_f32, mC, c_torch = create_and_permute_tensor(M, N, False, cutlass.Float32)  # 
 tensormap_pytorch_tensor = (torch.empty((2,128//8),dtype=torch.int64).fill_(0).cuda())
 tensormap_cute_tensor = from_dlpack(tensormap_pytorch_tensor, assumed_align=16)
 
-# Compile kernel
-matmul_fp8_nt_ = cute.compile(matmul_fp8_nt, mA, mB, mC, tensormap_cute_tensor)
-matmul_fp8_nt_(mA, mB, mC, tensormap_cute_tensor)
-# print(mC)
+# == benchmark ==
+import time
+import cuda.bindings.driver as cuda
 
+print("Compiling kernel with cute.compile ...")
+start_time = time.time()
+matmul_fp8_nt_ = cute.compile(matmul_fp8_nt, mA, mB, mC, tensormap_cute_tensor)
+
+compilation_time = time.time() - start_time
+print(f"Compilation time: {compilation_time:.4f} seconds")
+
+matmul_fp8_nt_(mA, mB, mC, tensormap_cute_tensor)
 # Verify correctness - compare with torch reference
-# Fixed: No need to transpose B since both A and B are k-major
 c_ref = torch.matmul(a_f32, b_f32.T)
 
 diff = calc_diff(c_torch, c_ref)
 print(f"diff: {diff}")
 assert diff < 1e-5
 print("FP8 GEMM kernel test passed!")
-# torch.testing.assert_close(c_torch.cpu(), c_ref, rtol=1e-2, atol=1e-2)  # Lower tolerance for fp8
-# print("FP8 GEMM kernel test passed!")
+
+print("Executing FP8 GEMM kernel...")
+# Get current CUDA stream from PyTorch
+torch_stream = torch.cuda.current_stream()
+
+# Get the raw stream pointer as a CUstream
+current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+# Create CUDA events for timing
+start_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
+end_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
+
+warmup_iterations = 10
+iterations = 100
+# Warmup
+for _ in range(warmup_iterations):
+    matmul_fp8_nt_(mA, mB, mC, tensormap_cute_tensor)
+
+# Use the current stream for CUDA events instead of the default stream
+# Record start event
+cuda.cuEventRecord(start_event, current_stream)
+
+# Execute the kernel
+for _ in range(iterations):
+    matmul_fp8_nt_(mA, mB, mC, tensormap_cute_tensor)
+
+# Record end event
+cuda.cuEventRecord(end_event, current_stream)
+cuda.cuEventSynchronize(end_event)
+
+# Calculate elapsed time
+err, elapsed_time = cuda.cuEventElapsedTime(start_event, end_event)
+
+# Print execution results
+print(f"Kernel execution time: {elapsed_time / iterations:.4f} ms")
+
+# Destroy events
+cuda.cuEventDestroy(start_event)
+cuda.cuEventDestroy(end_event)
+    
