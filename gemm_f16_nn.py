@@ -59,7 +59,7 @@ def _make_smem_layout_AB(dtype, major_mode, copy_bits, smem_tiler):
         0,
         layout_atom_outer,
     )
-    layout = cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))# if not is_row_major else (1, 0, 2))
+    layout = cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2) if is_row_major else (1, 0, 2))
     return layout
 
 @cute.jit
@@ -171,7 +171,7 @@ def gemm_f16f16f16_nn_kernel(
     C_local.fill(0)
 
     # cute.copy(tiled_copy_A, tAgA[None, None, None, 0], tAsA[None, None, None, 0])
-    cute.copy(tiled_copy_B, tBgB[None, None, None, 0], tBsB[None, None, None, 0])
+    # cute.copy(tiled_copy_B, tBgB[None, None, None, 0], tBsB[None, None, None, 0])
 
     bidx, bidy = bidy, bidx
 
@@ -188,18 +188,18 @@ def gemm_f16f16f16_nn_kernel(
             modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
         )
 
-    # for i_2 in range(4):
+    for i_2 in range(4):
         
-    #     smem_offset = ((((((((((tidx) & 15) >> 3) * 4096) + (i_2 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
+        smem_offset = ((((((((((tidx) & 15) >> 3) * 4096) + (i_2 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
         
-    #     global_offset = ((((i_2 * 8192) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8))
+        global_offset = ((((i_2 * 8192) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8))
 
-    #     cp_async_shared_global(
-    #         dst = smem_storage.iterator + smem_offset,
-    #         src = mB.iterator + global_offset, 
-    #         cp_size = 16,
-    #         modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-    #     )
+        cp_async_shared_global(
+            dst = smem_storage.iterator + smem_offset,
+            src = mB.iterator + global_offset, 
+            cp_size = 16,
+            modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
+        )
 
 
     cute.arch.cp_async_commit_group()
@@ -208,7 +208,7 @@ def gemm_f16f16f16_nn_kernel(
         cute.arch.sync_threads()
 
         # cute.copy(tiled_copy_A, tAgA[None, None, None, k+1], tAsA[None, None, None, (k+1) & 1])
-        cute.copy(tiled_copy_B, tBgB[None, None, None, k+1], tBsB[None, None, None, (k+1) & 1])
+        # cute.copy(tiled_copy_B, tBgB[None, None, None, k+1], tBsB[None, None, None, (k+1) & 1])
 
         for i_3 in range(4):
 
@@ -223,18 +223,18 @@ def gemm_f16f16f16_nn_kernel(
                 modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
             )
         
-        # for i_4 in range(4):
+        for i_4 in range(4):
 
-        #     smem_offset = ((((((((((k + 1) & 1) * 8192) + ((((tidx) & 15) >> 3) * 4096)) + (i_4 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
+            smem_offset = ((((((((((k + 1) & 1) * 8192) + ((((tidx) & 15) >> 3) * 4096)) + (i_4 * 1024)) + (((tidx) >> 4) * 128)) + (((((tidx) >> 6) + (((tidx) & 7) >> 2)) & 1) * 64)) + ((((((tidx) & 63) >> 5) + (((tidx) & 3) >> 1)) & 1) * 32)) + ((((((tidx) & 31) >> 4) + ((tidx) & 1)) & 1) * 16)) + 16384)
 
-        #     global_offset = ((((((k * 32768) + (i_4 * 8192)) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8)) + 32768)
+            global_offset = ((((((k * 32768) + (i_4 * 8192)) + (((tidx) >> 4) * 1024)) + ((bidx) * 128)) + (((tidx) & 15) * 8)) + 32768)
 
-        #     cp_async_shared_global(
-        #         dst = smem_storage.iterator + smem_offset,
-        #         src = mB.iterator + global_offset, 
-        #         cp_size = 16,
-        #         modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
-        #     )
+            cp_async_shared_global(
+                dst = smem_storage.iterator + smem_offset,
+                src = mB.iterator + global_offset, 
+                cp_size = 16,
+                modifier = nvvm.LoadCacheModifierKind.CG  # enable L2 prefetch
+            )
 
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(1)
